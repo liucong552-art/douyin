@@ -24,11 +24,11 @@ dyrec logs                              # 查看最近 100 行日志并持续跟
 - 更新 Cookie 时，终端会隐藏粘贴的内容。空闲时服务会重启以应用新 Cookie，正在录像时会等录像结束后再应用。
 - 在日志界面按 `Ctrl+C` 只退出查看，录播服务会继续运行。
 
-## 清空所有直播间条目并保留录像
+## 只清理已暂停的直播间条目
 
-这个操作只清空 `dyrec list` 里的全部条目，包括已暂停的直播间。录播容器和当前录像继续运行，已有录像仍在 `/opt/douyin-recorder/downloads/`。
+`dyrec del 1` 会暂停编号 1 的直播间并保留条目。下面这段命令会从列表中移除所有标为「已暂停」的条目，保留标为「监测中」的直播间和已有录像。录播服务会继续运行。
 
-以 root 在录播服务器执行下面整段命令。它会先备份直播间列表，再清空列表。
+如果刚执行 `dyrec del`，等程序处理完暂停再清理。以 root 在录播服务器执行下面整段命令，原列表会先备份到 `/opt/douyin-recorder/backup_config/`。
 
 ```bash
 (
@@ -36,15 +36,40 @@ dyrec logs                              # 查看最近 100 行日志并持续跟
     cd /opt/douyin-recorder
     list=config/URL_config.ini
     test -f "$list"
-    backup="$(mktemp backup_config/URL_config.ini.before-clear.XXXXXXXX)"
+    backup="$(mktemp backup_config/URL_config.ini.before-remove-paused.XXXXXXXX)"
     cp -- "$list" "$backup"
-    printf '原直播间列表已备份到 %s/%s\n' "$PWD" "$backup"
-    : > "$list"
+    updated="$(mktemp config/.URL_config.ini.XXXXXXXX)"
+    trap 'rm -f -- "$updated"' EXIT
+    cp -p -- "$list" "$updated"
+
+    removed="$(python3 - "$backup" "$updated" <<'PY'
+from codecs import BOM_UTF8
+from pathlib import Path
+import sys
+
+backup, updated = map(Path, sys.argv[1:])
+original = backup.read_bytes()
+lines = original.decode("utf-8-sig").splitlines(keepends=True)
+kept = [line for line in lines if not line.lstrip().startswith("#")]
+bom = BOM_UTF8 if original.startswith(BOM_UTF8) else b""
+updated.write_bytes(bom + "".join(kept).encode("utf-8"))
+print(len(lines) - len(kept))
+PY
+    )"
+
+    if [ "$removed" -gt 0 ]; then
+        if ! cmp -s -- "$list" "$backup"; then
+            printf '直播间列表刚被更新，请重新执行。\n' >&2
+            exit 1
+        fi
+        mv -fT -- "$updated" "$list"
+    fi
+    printf '已移除 %s 个暂停条目。原列表备份在 %s/%s\n' "$removed" "$PWD" "$backup"
     dyrec list
 )
 ```
 
-看到「目前没有直播间」就表示列表已经清空。这个版本会保留已经启动的监测任务，所以旧直播间后续仍可能继续被录制。如果也想结束旧的监测任务，等当前录像结束后，再执行 `cd /opt/douyin-recorder && docker compose restart app`，让服务按清空后的列表启动。
+清理后，剩余条目会重新编号。下次暂停或恢复直播间时，以 `dyrec list` 显示的编号为准。
 
 ## 获取并更新抖音 Cookie
 
