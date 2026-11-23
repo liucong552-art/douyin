@@ -24,6 +24,42 @@ dyrec logs                              # 查看最近 100 行日志并持续跟
 - 更新 Cookie 时，终端会隐藏粘贴的内容。空闲时服务会重启以应用新 Cookie，正在录像时会等录像结束后再应用。
 - 在日志界面按 `Ctrl+C` 只退出查看，录播服务会继续运行。
 
+## 清空所有直播间条目并保留录像
+
+这个操作会清空 `dyrec list` 里的全部条目，包括已暂停的直播间。已有录像仍在 `/opt/douyin-recorder/downloads/`。清空时录播容器会短暂停止以结束旧的监测任务。先执行 `dyrec status`，如果正在录制，等录完再操作。
+
+以 root 在录播服务器执行下面整段命令。它会先备份直播间列表，再清空并启动录播容器。
+
+```bash
+(
+    set -e
+    cd /opt/douyin-recorder
+    list=config/URL_config.ini
+    test -f "$list"
+    backup="$(mktemp backup_config/URL_config.ini.before-clear.XXXXXXXX)"
+    docker compose stop app
+    trap 'docker compose start app' EXIT
+    cp -- "$list" "$backup"
+    printf '原直播间列表已备份到 %s/%s\n' "$PWD" "$backup"
+    : > "$list"
+    docker compose start app
+    trap - EXIT
+    dyrec list
+)
+```
+
+看到「目前没有直播间」就表示清空成功。以后要添加主播，照常用 `dyrec add`。
+
+## 获取并更新抖音 Cookie
+
+1. 在电脑上的 Chrome 或 Edge 打开抖音网页版，登录你自己的账号，再进入任意抖音直播间。旧 Cookie 已失效时，先重新登录。
+2. 按 `F12` 打开开发者工具，切到 **网络（Network）**，然后刷新直播间页面，让浏览器重新记录请求。
+3. 点开一个请求网址以 `https://live.douyin.com/` 开头的请求。如果列表里有 `webcast/room/web/enter`，可以先点它。在右侧 **标头（Headers）** 里找到 **请求标头（Request Headers）**。
+4. 找到 `cookie`，复制它的完整值。若复制出来包含开头的 `cookie:`，粘贴前去掉这个字段名。当前请求没有 `cookie` 时，换一个发往 `live.douyin.com` 的请求查看。
+5. 在录播服务器执行 `dyrec cookie`。看到提示后粘贴并按回车。输入内容会隐藏，看到「Cookie 已写入」就表示录播配置已经保存。
+
+Cookie 是账号的登录凭据，只粘贴到自己服务器上的 `dyrec cookie` 提示里。浏览器界面可参考 [Chrome 网络面板](https://developer.chrome.com/docs/devtools/network/reference/) 和 [Edge 网络面板](https://learn.microsoft.com/en-us/microsoft-edge/devtools/network/reference)。
+
 ## 录像和配置
 
 新安装的主播列表和 Cookie 都是空的。项目数据在 `/opt/douyin-recorder/`，录像在 `/opt/douyin-recorder/downloads/`。重复执行安装命令会保留已有配置、录像和运行中的容器。
