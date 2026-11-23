@@ -1,0 +1,749 @@
+#!/usr/bin/env bash
+set -Euo pipefail
+
+BASE="/opt/douyin-recorder"
+URLFILE="$BASE/config/URL_config.ini"
+CONFIG="$BASE/config/config.ini"
+BACKUP="$BASE/backup_config"
+CONTAINER="douyin-recorder"
+
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo "$0" "$@"
+fi
+
+die() {
+    echo "❌ $*" >&2
+    exit 1
+}
+
+check_env() {
+    [ -d "$BASE" ] || die "$BASE 不存在"
+    [ -f "$URLFILE" ] || die "$URLFILE 不存在"
+    [ -f "$CONFIG" ] || die "$CONFIG 不存在"
+
+    docker inspect "$CONTAINER" >/dev/null 2>&1 ||
+        die "容器 $CONTAINER 不存在"
+}
+
+backup_urls() {
+    mkdir -p "$BACKUP"
+    cp "$URLFILE" \
+       "$BACKUP/URL_config.ini.dyrec.$(date +%Y%m%d-%H%M%S)"
+}
+
+get_interval() {
+    python3 - "$CONFIG" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+text = Path(sys.argv[1]).read_text(
+    encoding="utf-8-sig"
+)
+
+m = re.search(
+    r"(?m)^循环时间\(秒\)\s*=\s*(\d+)",
+    text
+)
+
+print(m.group(1) if m else "未知")
+PY
+}
+
+extract_url() {
+    python3 - "$1" <<'PY'
+import re
+import sys
+
+text = sys.argv[1]
+
+m = re.search(
+    r'https?://(?:v\.douyin\.com|live\.douyin\.com)/[^\s]+',
+    text
+)
+
+if not m:
+    raise SystemExit(1)
+
+url = m.group(0).rstrip(
+    '，。；;,！!）)]}>"\''
+)
+
+print(url)
+PY
+}
+
+resolve_short_url() {
+    local short="$1"
+    local tmp
+    tmp="$(mktemp /tmp/dyrec-resolve.XXXXXXXX)"
+
+    echo "正在自动解析抖音短链接..." >&2
+
+    #
+    # 第一种：先利用 HTTP 跳转直接寻找直播房间号
+    #
+    local rid=""
+
+    rid="$(
+        docker exec -i -w /app "$CONTAINER" \
+            python - "$short" 2>>"$tmp" <<'PY'
+import re
+import sys
+import requests
+
+url = sys.argv[1]
+
+headers = {
+    "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+}
+
+try:
+    r = requests.get(
+        url,
+        headers=headers,
+        timeout=15,
+        allow_redirects=True
+    )
+
+    final = r.url
+
+    print(
+        "HTTP最终地址：" + final,
+        file=sys.stderr
+    )
+
+    patterns = [
+        r'live\.douyin\.com/(\d+)',
+        r'/root/live/(\d+)',
+        r'/follow/live/(\d+)',
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, final)
+        if m:
+            print(m.group(1))
+            raise SystemExit(0)
+
+except Exception as e:
+    print(
+        "HTTP解析未获得房间号：" + repr(e),
+        file=sys.stderr
+    )
+
+raise SystemExit(2)
+PY
+    )" || true
+
+    rid="$(
+        printf '%s\n' "$rid" |
+        grep -E '^[0-9]+$' |
+        tail -1 || true
+    )"
+
+    if [ -n "$rid" ]; then
+        rm -f "$tmp"
+        echo "$rid"
+        return 0
+    fi
+
+    #
+    # 第二种：调用 DouyinLiveRecorder 自带的 room 解析
+    #
+    rid="$(
+        docker exec -i -w /app "$CONTAINER" \
+            python - "$short" 2>>"$tmp" <<'PY'
+import asyncio
+import inspect
+import sys
+
+from src.room import (
+    get_sec_user_id,
+    get_live_room_id
+)
+
+url = sys.argv[1]
+
+async def value(x):
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+async def main():
+    result = await value(
+        get_sec_user_id(url)
+    )
+
+    if not result:
+        raise RuntimeError(
+            "get_sec_user_id 没有返回数据"
+        )
+
+    room_id, sec_user_id = result
+
+    web_rid = await value(
+        get_live_room_id(
+            room_id,
+            sec_user_id
+        )
+    )
+
+    if not web_rid:
+        raise RuntimeError(
+            "没有获得 web_rid"
+        )
+
+    print(str(web_rid))
+
+asyncio.run(main())
+PY
+    )" || {
+        echo >&2
+        echo "❌ 抖音短链接解析失败" >&2
+
+        if [ -s "$tmp" ]; then
+            echo "========== 解析错误 ==========" >&2
+            cat "$tmp" >&2
+            echo "==============================" >&2
+        fi
+
+        rm -f "$tmp"
+        return 1
+    }
+
+    rm -f "$tmp"
+
+    rid="$(
+        printf '%s\n' "$rid" |
+        grep -E '^[0-9]+$' |
+        tail -1 || true
+    )"
+
+    [ -n "$rid" ] ||
+        die "没有解析出直播间房间号"
+
+    echo "$rid"
+}
+
+resolve_url() {
+    local input="$1"
+    local url
+
+    if ! url="$(extract_url "$input")"; then
+        die "输入内容里没有找到抖音直播链接"
+    fi
+
+    # 已经是网页版地址
+    if [[ "$url" =~ live\.douyin\.com/([0-9]+) ]]; then
+        echo "https://live.douyin.com/${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    # 抖音短链
+    if [[ "$url" == *"v.douyin.com/"* ]]; then
+        local rid
+
+        if ! rid="$(resolve_short_url "$url")"; then
+            return 1
+        fi
+
+        echo "https://live.douyin.com/$rid"
+        return 0
+    fi
+
+    die "暂不支持这个地址：$url"
+}
+
+add_room() {
+    local input="${*:-}"
+
+    if [ -z "$input" ]; then
+        echo "请粘贴抖音链接或整段分享文字："
+        IFS= read -r input </dev/tty
+    fi
+
+    local url
+
+    if ! url="$(resolve_url "$input")"; then
+        echo "❌ 新增失败，没有修改直播间配置。" >&2
+        return 1
+    fi
+
+    echo
+    echo "✅ 解析结果："
+    echo "$url"
+
+    backup_urls
+
+    local result
+
+    result="$(
+        python3 - "$URLFILE" "$url" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+url = sys.argv[2]
+
+lines = p.read_text(
+    encoding="utf-8-sig"
+).splitlines()
+
+found_index = None
+was_disabled = False
+
+for i, line in enumerate(lines):
+    s = line.strip()
+
+    if not s:
+        continue
+
+    disabled = s.startswith("#")
+
+    if disabled:
+        s = s[1:].strip()
+
+    # 程序可能自动加：
+    # ,主播: xxx
+    base = s.split(",", 1)[0].strip()
+
+    if base == url:
+        found_index = i
+        was_disabled = disabled
+        break
+
+if found_index is None:
+    lines.append(url)
+    result = "ADDED"
+
+elif was_disabled:
+    lines[found_index] = url
+    result = "REENABLED"
+
+else:
+    result = "EXISTS"
+
+p.write_text(
+    "\n".join(lines).rstrip() + "\n",
+    encoding="utf-8-sig"
+)
+
+print(result)
+PY
+    )"
+
+    echo
+
+    case "$result" in
+        ADDED)
+            echo "✅ 已新增直播间"
+            ;;
+        REENABLED)
+            echo "✅ 已重新启用直播间"
+            ;;
+        EXISTS)
+            echo "ℹ️ 该直播间已经在监测"
+            ;;
+    esac
+
+    echo "地址：$url"
+    echo "监测周期：$(get_interval) 秒"
+    echo
+    echo "✅ 无需重启容器，不影响当前正在录制的直播。"
+}
+
+list_rooms() {
+    python3 - "$URLFILE" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+
+lines = p.read_text(
+    encoding="utf-8-sig"
+).splitlines()
+
+entries = [
+    x.strip()
+    for x in lines
+    if x.strip()
+]
+
+if not entries:
+    print("目前没有直播间。")
+    raise SystemExit
+
+print("编号  状态      直播间")
+print("-" * 75)
+
+for n, line in enumerate(entries, 1):
+    disabled = line.startswith("#")
+
+    value = (
+        line[1:].strip()
+        if disabled
+        else line
+    )
+
+    state = (
+        "已暂停"
+        if disabled
+        else "监测中"
+    )
+
+    print(
+        f"{n:<5} {state:<8} {value}"
+    )
+PY
+}
+
+change_room_state() {
+    local action="$1"
+    local target="${2:-}"
+
+    [ -n "$target" ] ||
+        die "请提供编号或房间号"
+
+    backup_urls
+
+    python3 - "$URLFILE" "$action" "$target" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+action = sys.argv[2]
+target = sys.argv[3]
+
+lines = p.read_text(
+    encoding="utf-8-sig"
+).splitlines()
+
+entries = [
+    (i, line)
+    for i, line in enumerate(lines)
+    if line.strip()
+]
+
+selected = None
+
+if target.isdigit():
+    n = int(target)
+
+    if 1 <= n <= len(entries):
+        selected = entries[n - 1][0]
+
+if selected is None:
+    matches = []
+
+    for idx, line in entries:
+        s = line.strip().lstrip("#").strip()
+
+        if target in s:
+            matches.append(idx)
+
+    if len(matches) == 1:
+        selected = matches[0]
+
+    elif len(matches) > 1:
+        raise SystemExit(
+            "❌ 匹配多个直播间，请使用编号"
+        )
+
+if selected is None:
+    raise SystemExit(
+        "❌ 没找到这个直播间"
+    )
+
+line = lines[selected].strip()
+
+if action == "disable":
+
+    if line.startswith("#"):
+        print("ℹ️ 已经暂停")
+
+    else:
+        lines[selected] = "#" + line
+        print("✅ 已取消监测")
+
+elif action == "enable":
+
+    if line.startswith("#"):
+        lines[selected] = line[1:].strip()
+        print("✅ 已恢复监测")
+
+    else:
+        print("ℹ️ 已经处于监测状态")
+
+p.write_text(
+    "\n".join(lines).rstrip() + "\n",
+    encoding="utf-8-sig"
+)
+
+print(
+    lines[selected]
+    .lstrip("#")
+    .strip()
+)
+PY
+
+    echo
+    echo "✅ 不重启容器，其他主播不受影响。"
+}
+
+cookie_cmd() {
+    local cookie
+
+    echo "======================================"
+    echo " 更新 DouyinLiveRecorder Cookie"
+    echo "======================================"
+    echo
+
+    read -rsp \
+        "请粘贴新的抖音 Cookie（不会显示）: " \
+        cookie
+
+    echo
+
+    [ -n "$cookie" ] ||
+        die "Cookie 不能为空"
+
+    [ "${#cookie}" -ge 100 ] ||
+        die "Cookie 看起来过短"
+
+    mkdir -p "$BACKUP"
+
+    cp "$CONFIG" \
+       "$BACKUP/config.ini.before-cookie.$(date +%Y%m%d-%H%M%S)"
+
+    python3 - "$CONFIG" \
+        3<<<"$cookie" <<'PY'
+from pathlib import Path
+import os
+import re
+import sys
+
+cfg = Path(sys.argv[1])
+
+cookie = os.fdopen(3).read().strip()
+
+text = cfg.read_text(
+    encoding="utf-8-sig"
+)
+
+text, n = re.subn(
+    r"(?m)^抖音cookie\s*=.*$",
+    lambda m:
+        "抖音cookie = " + cookie,
+    text,
+    count=1
+)
+
+if n != 1:
+    raise SystemExit(
+        "❌ 找不到抖音cookie配置项"
+    )
+
+cfg.write_text(
+    text,
+    encoding="utf-8-sig"
+)
+
+print("✅ Cookie 已写入")
+print("✅ 长度：", len(cookie))
+PY
+
+    cookie=""
+
+    if docker exec "$CONTAINER" \
+        pgrep -x ffmpeg >/dev/null 2>&1
+    then
+        echo
+        echo "🔴 当前正在录像"
+        echo "✅ 不立即重启，避免中断录像"
+        echo "✅ 已安排录像完全停止后自动应用新 Cookie"
+
+        systemd-run \
+            --unit="dyrec-cookie-$(date +%s)" \
+            --collect \
+            /bin/bash -c '
+                stable=0
+
+                while true
+                do
+                    if docker exec douyin-recorder \
+                        pgrep -x ffmpeg >/dev/null 2>&1
+                    then
+                        stable=0
+                    else
+                        stable=$((stable + 1))
+                    fi
+
+                    # 连续3分钟没有ffmpeg才认为直播真的结束
+                    if [ "$stable" -ge 3 ]; then
+                        break
+                    fi
+
+                    sleep 60
+                done
+
+                cd /opt/douyin-recorder
+                docker compose restart
+            ' >/dev/null
+
+    else
+        echo
+        echo "当前没有录像，立即应用 Cookie..."
+
+        cd "$BASE"
+        docker compose restart
+
+        sleep 5
+
+        echo "✅ 新 Cookie 已生效"
+    fi
+}
+
+status_cmd() {
+    echo "========== DouyinLiveRecorder =========="
+
+    if docker ps \
+        --format '{{.Names}}' |
+        grep -qx "$CONTAINER"
+    then
+        echo "容器：✅ 正在运行"
+    else
+        echo "容器：❌ 未运行"
+    fi
+
+    echo "监测周期：$(get_interval) 秒"
+
+    if docker exec "$CONTAINER" \
+        pgrep -x ffmpeg >/dev/null 2>&1
+    then
+        echo "录像状态：🔴 正在录制"
+    else
+        echo "录像状态：⚪ 当前没有录像"
+    fi
+
+    echo
+    list_rooms
+
+    echo
+    echo "========== 最近录像 =========="
+
+    find "$BASE/downloads" \
+        -type f \
+        \( -name '*.ts' -o -name '*.mp4' \) \
+        -printf '%T@ %TY-%Tm-%Td %TH:%TM  %s  %p\n' \
+        2>/dev/null |
+        sort -nr |
+        head -5 |
+        cut -d' ' -f2- || true
+
+    echo
+    echo -n "录像临时目录："
+    du -sh "$BASE/downloads" \
+        2>/dev/null |
+        awk '{print $1}' || true
+
+    echo -n "磁盘剩余："
+    df -h / |
+        awk 'NR==2 {print $4}'
+}
+
+logs_cmd() {
+    docker logs \
+        --tail=100 \
+        -f \
+        "$CONTAINER"
+}
+
+case "${1:-help}" in
+
+    add)
+        shift
+        check_env
+        add_room "$@"
+        ;;
+
+    resolve)
+        shift
+        check_env
+
+        [ "$#" -gt 0 ] ||
+            die "请提供抖音链接"
+
+        resolve_url "$*"
+        ;;
+
+    list|ls)
+        check_env
+        list_rooms
+        ;;
+
+    del|remove|disable)
+        check_env
+        change_room_state \
+            disable \
+            "${2:-}"
+        ;;
+
+    enable|on)
+        check_env
+        change_room_state \
+            enable \
+            "${2:-}"
+        ;;
+
+    cookie)
+        check_env
+        cookie_cmd
+        ;;
+
+    status|st)
+        check_env
+        status_cmd
+        ;;
+
+    logs|log)
+        check_env
+        logs_cmd
+        ;;
+
+    help|-h|--help)
+        cat <<'EOF'
+dyrec - 抖音录播自动管理
+
+新增：
+  dyrec add '抖音分享链接'
+  dyrec add '整段抖音分享文字'
+
+测试短链解析：
+  dyrec resolve 'https://v.douyin.com/xxxx/'
+
+查看：
+  dyrec list
+
+取消：
+  dyrec del 1
+
+恢复：
+  dyrec enable 1
+
+更新Cookie：
+  dyrec cookie
+
+查看状态：
+  dyrec status
+
+实时日志：
+  dyrec logs
+EOF
+        ;;
+
+    *)
+        die "未知命令，执行 dyrec help"
+        ;;
+esac
