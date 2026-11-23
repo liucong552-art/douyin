@@ -1,6 +1,18 @@
-# 抖音直播录播
+# 网盘、视频和抖音直播录播
 
-在使用 systemd 的 Debian 12（Bookworm）或 Debian 13（Trixie）服务器上，以 root 执行下面一行。支持 amd64 和 arm64。安装脚本会准备 Docker、Compose 和 Python 3，启动 DouyinLiveRecorder v4.0.7，并安装 `dyrec`。
+## 一行安装
+
+在使用 systemd 的 Debian 12/13 或 Ubuntu 22.04/24.04 服务器上，以 root 执行下面一行。已在 Debian 13 真机和 Ubuntu 24.04 隔离环境验证。
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/douyin/main/install-services.sh' -o /root/install-services.sh && chmod 700 /root/install-services.sh && bash /root/install-services.sh
+```
+
+- 输入 `1` 安装网盘和 Jellyfin，或输入 `3` 安装全部服务。脚本会依次询问网盘域名和视频域名。两个域名应提前解析到服务器，`80` 和 `443` 端口需要可用并允许公网访问。反向代理会自动申请 HTTPS 证书。
+- 输入 `2` 只安装抖音录播。录播服务无需域名，安装后可直接使用 `dyrec`。
+- 网盘和 Jellyfin 的初始登录信息在 `/opt/cloud-video/credentials.json`，以 root 查看。把视频上传到网盘的 `media` 目录，Jellyfin 会从这里读取视频。
+
+## 只安装抖音录播的直达命令
 
 ```bash
 curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/douyin/main/install.sh' -o /root/douyin-install.sh && chmod 700 /root/douyin-install.sh && bash /root/douyin-install.sh

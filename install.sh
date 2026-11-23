@@ -36,12 +36,12 @@ install_dependencies() {
     apt-get -o Acquire::Retries=3 update
     if (( needs_docker_repo )) && ! apt-cache show docker-compose-plugin >/dev/null 2>&1; then
         apt-get install -y --no-install-recommends ca-certificates
-        download 'https://download.docker.com/linux/debian/gpg' "$scratch/docker.asc"
+        download "https://download.docker.com/linux/$ID/gpg" "$scratch/docker.asc"
         install -d -m 0755 /etc/apt/keyrings
         install -m 0644 "$scratch/docker.asc" /etc/apt/keyrings/dyrec-docker.asc
         cat > /etc/apt/sources.list.d/dyrec-docker.sources <<EOF
 Types: deb
-URIs: https://download.docker.com/linux/debian
+URIs: https://download.docker.com/linux/$ID
 Suites: $VERSION_CODENAME
 Components: stable
 Architectures: $arch
@@ -66,9 +66,10 @@ install_default() {
 [[ -r /etc/os-release ]] || fail '无法读取系统版本'
 # shellcheck source=/dev/null
 source /etc/os-release
-if [[ ${ID:-} != debian || ! ${VERSION_CODENAME:-} =~ ^(bookworm|trixie)$ ]]; then
-    fail '请在 Debian 12 或 Debian 13 上运行'
-fi
+case "${ID:-}:${VERSION_CODENAME:-}" in
+    debian:bookworm|debian:trixie|ubuntu:jammy|ubuntu:noble) ;;
+    *) fail '支持 Debian 12/13 和 Ubuntu 22.04/24.04' ;;
+esac
 arch="$(dpkg --print-architecture)"
 [[ "$arch" =~ ^(amd64|arm64)$ ]] || fail "镜像不支持 $arch"
 command -v curl >/dev/null || fail '请先安装 curl'
