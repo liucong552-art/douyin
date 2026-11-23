@@ -26,9 +26,9 @@ dyrec logs                              # 查看最近 100 行日志并持续跟
 
 ## 清空所有直播间条目并保留录像
 
-这个操作会清空 `dyrec list` 里的全部条目，包括已暂停的直播间。已有录像仍在 `/opt/douyin-recorder/downloads/`。清空时录播容器会短暂停止以结束旧的监测任务。先执行 `dyrec status`，如果正在录制，等录完再操作。
+这个操作只清空 `dyrec list` 里的全部条目，包括已暂停的直播间。录播容器和当前录像继续运行，已有录像仍在 `/opt/douyin-recorder/downloads/`。
 
-以 root 在录播服务器执行下面整段命令。它会先备份直播间列表，再清空并启动录播容器。
+以 root 在录播服务器执行下面整段命令。它会先备份直播间列表，再清空列表。
 
 ```bash
 (
@@ -37,18 +37,14 @@ dyrec logs                              # 查看最近 100 行日志并持续跟
     list=config/URL_config.ini
     test -f "$list"
     backup="$(mktemp backup_config/URL_config.ini.before-clear.XXXXXXXX)"
-    docker compose stop app
-    trap 'docker compose start app' EXIT
     cp -- "$list" "$backup"
     printf '原直播间列表已备份到 %s/%s\n' "$PWD" "$backup"
     : > "$list"
-    docker compose start app
-    trap - EXIT
     dyrec list
 )
 ```
 
-看到「目前没有直播间」就表示清空成功。以后要添加主播，照常用 `dyrec add`。
+看到「目前没有直播间」就表示列表已经清空。这个版本会保留已经启动的监测任务，所以旧直播间后续仍可能继续被录制。如果也想结束旧的监测任务，等当前录像结束后，再执行 `cd /opt/douyin-recorder && docker compose restart app`，让服务按清空后的列表启动。
 
 ## 获取并更新抖音 Cookie
 
