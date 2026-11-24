@@ -12,6 +12,24 @@ curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/douyin/main/install
 - 输入 `2` 只安装抖音录播。录播服务无需域名，安装后可直接使用 `dyrec`。
 - 网盘和 Jellyfin 的初始登录信息在 `/opt/cloud-video/credentials.json`，以 root 查看。把视频上传到网盘的 `media` 目录，Jellyfin 会从这里读取视频。
 
+## 修改网盘和视频密码
+
+### 网盘密码
+
+以 root 在网盘所在服务器的 SSH 终端执行下面一行，按提示输入两次新密码。密码至少 12 位，可用字母、数字、下划线和短横线。输入时终端不会显示字符。
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/douyin/main/reset-cloud-password.py' -o /root/reset-cloud-password.py && python3 /root/reset-cloud-password.py
+```
+
+改密时网盘容器会短暂重建，已有文件会保留。Jellyfin 和抖音录播会继续运行。成功后用原用户名和新密码登录。
+
+### Jellyfin 视频密码
+
+打开视频网站，用当前密码登录，点右上角头像，依次进入「设置」和「密码」，输入当前密码和新密码并保存。[Jellyfin 密码管理文档](https://jellyfin.org/docs/general/server/users/adding-managing-users/#password)
+
+第一次登录时，可以在服务器运行 `cat /opt/cloud-video/credentials.json` 查看 `jellyfin_password`。网页改密后，以新密码登录，文件中的 `jellyfin_password` 仍是初始密码。
+
 ## 只安装抖音录播的直达命令
 
 ```bash
